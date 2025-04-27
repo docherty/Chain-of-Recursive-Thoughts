@@ -8,7 +8,7 @@ import sys
 import time
 
 class EnhancedRecursiveThinkingChat:
-    def __init__(self, api_key: str = None, model: str = "anthropic/claude-3.7-sonnet:beta"):
+    def __init__(self, api_key: str = None, model: str = "mistralai/mistral-small-3.1-24b-instruct:free"):
         """Initialize with OpenRouter API."""
         self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
         self.model = model

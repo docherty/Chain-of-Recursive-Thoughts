@@ -6,7 +6,7 @@
 CoRT makes AI models recursively think about their responses, generate alternatives, and pick the best one. It's like giving the AI the ability to doubt itself and try again... and again... and again, using the OpenRouter API.
 
 ### Does it actually work?
-YES. I tested it with Mistral 7B Instruct (free tier) and it went from "meh" to "holy crap", especially for such a small model, at programming tasks. (Performance varies by model).
+YES. Tests with models like Mistral 7B Instruct show significant improvement in task performance (e.g., programming) compared to direct generation. Performance varies by model.
 
 ## How it works
 1.  User provides input.
@@ -29,12 +29,45 @@ Mistral 7B Instruct *with* CoRT (Example Output):
 
 
 ## Try it yourself
-1.  **Clone/Download:** Get the code.
-2.  **Install Dependencies:**
+
+1.  **Clone/Download:** Get the code into a local directory.
+    ```bash
+    # Example if using git
+    # git clone <repository_url>
+    # cd <repository_directory>
+    ```
+
+2.  **Create a Virtual Environment:** (Recommended)
+    *   Navigate into the project directory in your terminal.
+    *   Create the environment (common name is `venv`):
+        ```bash
+        python3 -m venv venv
+        ```
+
+3.  **Activate the Virtual Environment:**
+    *   **macOS / Linux (bash/zsh):**
+        ```bash
+        source venv/bin/activate
+        ```
+    *   **Windows (Command Prompt):**
+        ```cmd
+        .\venv\Scripts\activate.bat
+        ```
+    *   **Windows (PowerShell):**
+        ```powershell
+        .\venv\Scripts\Activate.ps1
+        ```
+        *(Note: You might need to adjust PowerShell execution policy: `Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process`)*
+    *   Your terminal prompt should change to indicate the active environment (e.g., `(venv) your-prompt $`).
+
+4.  **Install Dependencies:** (While the venv is active)
     ```bash
     pip install -r requirements.txt
     ```
-3.  **Set API Key:**
+
+5.  **Set API Key:**
+   Set `OPENROUTER_API_KEY=xxxx` in your .env if you want to store it there or...
+
     ```bash
     # Recommended: Set environment variable (Linux/macOS)
     export OPENROUTER_API_KEY="your-key-here"
@@ -44,14 +77,22 @@ Mistral 7B Instruct *with* CoRT (Example Output):
     # $env:OPENROUTER_API_KEY="your-key-here"
     ```
     *Alternatively, the script will prompt you if the environment variable is not found.*
-4.  **Run the Script:**
+
+6.  **Run the Script:** (Make sure your venv is still active!)
     ```bash
-    python recursive_thinking_ai.py
+    # Use python3 or python depending on your system/venv setup
+    python3 recursive-thinking-ai.py
     ```
-5.  **Interact:** Chat with the AI!
+
+7.  **Interact:** Chat with the AI!
     *   Type `save` to save the current conversation history.
     *   Type `save log` to save the detailed thinking log for all interactions in the session.
     *   Type `exit` to quit.
+
+8.  **Deactivate (When Done):**
+    ```bash
+    deactivate
+    ```
 
 ### The Secret Sauce
 The magic is in:

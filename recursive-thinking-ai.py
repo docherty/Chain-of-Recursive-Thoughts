@@ -1,320 +1,610 @@
-import openai
 import os
-from typing import List, Dict
 import json
 import requests
+import re
+from typing import List, Dict, Tuple, Optional, Any
 from datetime import datetime
-import sys
-import time
+import time # Keep for potential future use (e.g., rate limiting)
+from dotenv import load_dotenv
+
+load_dotenv()
 
 class EnhancedRecursiveThinkingChat:
-    def __init__(self, api_key: str = None, model: str = "mistralai/mistral-small-3.1-24b-instruct:free"):
-        """Initialize with OpenRouter API."""
+    """
+    A chat client that uses a recursive thinking process involving multiple rounds
+    of generation, alternative creation, and evaluation via an LLM API (OpenRouter).
+    """
+    def __init__(self,
+                 api_key: Optional[str] = None,
+                 model: str = "mistralai/mistral-7b-instruct:free", # Updated default model example
+                 base_url: str = "https://openrouter.ai/api/v1",
+                 request_timeout: int = 60,
+                 default_max_tokens: int = 4096):
+        """
+        Initialize the chat client.
+
+        Args:
+            api_key: Your OpenRouter API key. Reads from OPENROUTER_API_KEY env var if None.
+            model: The model identifier to use on OpenRouter.
+            base_url: The base URL for the OpenRouter API.
+            request_timeout: Timeout in seconds for API requests.
+            default_max_tokens: Default maximum tokens for API responses.
+        """
         self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
+        if not self.api_key:
+            raise ValueError("API key not provided and OPENROUTER_API_KEY environment variable not set.")
+
         self.model = model
-        self.base_url = "https://openrouter.ai/api/v1/chat/completions"
+        self.base_url = base_url
+        self.request_timeout = request_timeout
+        self.default_max_tokens = default_max_tokens
+        self.chat_completions_url = f"{self.base_url}/chat/completions"
+
         self.headers = {
             "Authorization": f"Bearer {self.api_key}",
-            "HTTP-Referer": "http://localhost:3000",
-            "X-Title": "Recursive Thinking Chat",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            # Optional: Add Referer/X-Title if required by your setup or OpenRouter TOS
+            # "HTTP-Referer": "YOUR_SITE_URL",
+            # "X-Title": "YOUR_APP_TITLE",
         }
-        self.conversation_history = []
-        self.full_thinking_log = []
-    
-    def _call_api(self, messages: List[Dict], temperature: float = 0.7, stream: bool = True) -> str:
-        """Make an API call to OpenRouter with streaming support."""
+        self.conversation_history: List[Dict[str, str]] = []
+        self.full_thinking_log: List[Dict[str, Any]] = [] # Stores thinking history from all calls
+
+    def _call_api(self,
+                  messages: List[Dict[str, str]],
+                  temperature: float = 0.7,
+                  max_tokens: Optional[int] = None,
+                  stream: bool = True) -> str:
+        """
+        Make an API call to the OpenRouter Chat Completions endpoint.
+
+        Args:
+            messages: A list of message dictionaries (e.g., [{"role": "user", "content": "..."}]).
+            temperature: The sampling temperature.
+            max_tokens: Maximum tokens to generate. Uses instance default if None.
+            stream: Whether to stream the response.
+
+        Returns:
+            The complete response content as a string.
+
+        Raises:
+            requests.exceptions.RequestException: If the API request fails.
+            ValueError: If the response format is unexpected.
+        """
         payload = {
             "model": self.model,
             "messages": messages,
             "temperature": temperature,
+            "max_tokens": max_tokens or self.default_max_tokens,
             "stream": stream,
-            "reasoning": {
-                "max_tokens": 10386,
-            }
         }
-        
+
         try:
-            response = requests.post(self.base_url, headers=self.headers, json=payload, stream=stream)
-            response.raise_for_status()
-            
+            response = requests.post(
+                self.chat_completions_url,
+                headers=self.headers,
+                json=payload,
+                stream=stream,
+                timeout=self.request_timeout
+            )
+            response.raise_for_status() # Raises HTTPError for bad responses (4xx or 5xx)
+
             if stream:
                 full_response = ""
+                print("AI Stream: ", end="", flush=True)
                 for line in response.iter_lines():
                     if line:
-                        line = line.decode('utf-8')
-                        if line.startswith("data: "):
-                            line = line[6:]
-                            if line.strip() == "[DONE]":
+                        decoded_line = line.decode('utf-8')
+                        if decoded_line.startswith("data: "):
+                            content = decoded_line[6:]
+                            if content.strip() == "[DONE]":
                                 break
                             try:
-                                chunk = json.loads(line)
-                                if "choices" in chunk and len(chunk["choices"]) > 0:
+                                chunk = json.loads(content)
+                                if chunk.get("choices"):
                                     delta = chunk["choices"][0].get("delta", {})
-                                    content = delta.get("content", "")
-                                    if content:
-                                        full_response += content
-                                        print(content, end="", flush=True)
+                                    content_piece = delta.get("content")
+                                    if content_piece:
+                                        full_response += content_piece
+                                        print(content_piece, end="", flush=True)
                             except json.JSONDecodeError:
-                                continue
-                print()  # New line after streaming
+                                print(f"\nWarning: Could not decode JSON stream chunk: {content}", flush=True)
+                                continue # Ignore malformed chunks
+                print() # Newline after streaming
                 return full_response
             else:
-                return response.json()['choices'][0]['message']['content'].strip()
+                # Non-streaming response
+                response_data = response.json()
+                if response_data.get("choices"):
+                    return response_data['choices'][0]['message']['content'].strip()
+                else:
+                    raise ValueError(f"Unexpected API response format: {response_data}")
+
+        except requests.exceptions.RequestException as e:
+            print(f"\nAPI Request Error: {e}", flush=True)
+            raise # Re-raise the exception for handling upstream
         except Exception as e:
-            print(f"API Error: {e}")
-            return "Error: Could not get response from API"
-    
+            print(f"\nError processing API response: {e}", flush=True)
+            # Return error message or raise a custom exception
+            return f"Error: Could not process response: {e}"
+
+
     def _determine_thinking_rounds(self, prompt: str) -> int:
-        """Let the model decide how many rounds of thinking are needed."""
-        meta_prompt = f"""Given this message: "{prompt}"
-        
-How many rounds of iterative thinking (1-5) would be optimal to generate the best response?
-Consider the complexity and nuance required.
-Respond with just a number between 1 and 5."""
-        
+        """
+        Asks the LLM to estimate the optimal number of thinking rounds (1-5).
+
+        Args:
+            prompt: The user's input prompt.
+
+        Returns:
+            The estimated number of rounds (1-5), defaulting to 3 on failure.
+        """
+        meta_prompt = f"""Analyze the following user message:
+"{prompt}"
+
+Based on its apparent complexity, ambiguity, and the detail likely required for a high-quality response, estimate the optimal number of iterative thinking rounds needed (between 1 and 5). A simple factual query might need 1 round, while a complex creative or analytical task might need 3-5.
+
+Respond ONLY with a single digit (1, 2, 3, 4, or 5)."""
+
         messages = [{"role": "user", "content": meta_prompt}]
-        
+        default_rounds = 3
+
         print("\n=== DETERMINING THINKING ROUNDS ===")
-        response = self._call_api(messages, temperature=0.3, stream=True)
-        print("=" * 50 + "\n")
-        
         try:
-            rounds = int(''.join(filter(str.isdigit, response)))
-            return min(max(rounds, 1), 5)
-        except:
-            return 3
-    
-    def _generate_alternatives(self, base_response: str, prompt: str, num_alternatives: int = 3) -> List[str]:
-        """Generate alternative responses."""
+            # Use lower temperature for more deterministic choice
+            response = self._call_api(messages, temperature=0.2, stream=False)
+            print(f"LLM estimated rounds response: '{response}'") # Show raw response for debugging
+
+            # Robust parsing using regex
+            match = re.search(r'\b([1-5])\b', response)
+            if match:
+                rounds = int(match.group(1))
+                print(f"Parsed rounds: {rounds}")
+                return rounds
+            else:
+                print(f"Could not parse rounds from response, using default: {default_rounds}")
+                return default_rounds
+        except Exception as e:
+            print(f"Error determining thinking rounds: {e}. Using default: {default_rounds}")
+            return default_rounds
+        finally:
+            print("=" * 30 + "\n")
+
+
+    def _generate_alternatives(self, base_response: str, prompt: str, round_num: int, num_alternatives: int = 2) -> List[str]:
+        """
+        Generates alternative responses based on the current best response.
+
+        Args:
+            base_response: The current best response.
+            prompt: The original user prompt.
+            round_num: The current thinking round number.
+            num_alternatives: How many alternatives to generate.
+
+        Returns:
+            A list of alternative response strings.
+        """
         alternatives = []
-        
+        # Include conversation history for context
+        context_messages = self.conversation_history + [{"role": "user", "content": prompt}]
+
         for i in range(num_alternatives):
-            print(f"\n=== GENERATING ALTERNATIVE {i+1} ===")
-            alt_prompt = f"""Original message: {prompt}
-            
-Current response: {base_response}
+            print(f"\n--- Generating Alternative {i+1} (Round {round_num}) ---")
+            alt_prompt = f"""The original user message was: "{prompt}"
 
-Generate an alternative response that might be better. Be creative and consider different approaches.
+We are in thinking round {round_num}. The current best response is:
+"{base_response}"
+
+Generate a significantly different alternative response. Consider alternative interpretations, structures, or levels of detail. Focus on improving clarity, accuracy, or helpfulness compared to the current best. Do not simply rephrase; offer a distinct approach.
+
 Alternative response:"""
-            
-            messages = self.conversation_history + [{"role": "user", "content": alt_prompt}]
-            alternative = self._call_api(messages, temperature=0.7 + i * 0.1, stream=True)
-            alternatives.append(alternative)
-            print("=" * 50)
-        
+
+            # Slightly increase temperature for diversity in alternatives
+            temp = 0.7 + (i * 0.1)
+            try:
+                # Pass only the user alt_prompt for this specific task
+                alternative = self._call_api(
+                    context_messages + [{"role": "assistant", "content": base_response}, {"role": "user", "content": alt_prompt}],
+                    temperature=temp,
+                    stream=True
+                )
+                alternatives.append(alternative)
+            except Exception as e:
+                print(f"Error generating alternative {i+1}: {e}")
+                alternatives.append(f"Error generating alternative {i+1}") # Add placeholder
+            print("-" * 30)
+
         return alternatives
-    
-    def _evaluate_responses(self, prompt: str, current_best: str, alternatives: List[str]) -> tuple[str, str]:
-        """Evaluate responses and select the best one."""
+
+
+    def _evaluate_responses(self, prompt: str, current_best: str, alternatives: List[str]) -> Tuple[str, str]:
+        """
+        Asks the LLM to evaluate the current best response against alternatives.
+
+        Args:
+            prompt: The original user prompt.
+            current_best: The current best response string.
+            alternatives: A list of alternative response strings.
+
+        Returns:
+            A tuple containing (selected_best_response, explanation).
+            Returns (current_best, "Evaluation failed") on error.
+        """
         print("\n=== EVALUATING RESPONSES ===")
-        eval_prompt = f"""Original message: {prompt}
+        eval_prompt = f"""Original user message:
+"{prompt}"
 
-Evaluate these responses and choose the best one:
+Evaluate the following responses based on accuracy, clarity, completeness, and relevance to the original message.
 
-Current best: {current_best}
+Current Best Response:
+"{current_best}"
 
-Alternatives:
+Alternative Responses:
 {chr(10).join([f"{i+1}. {alt}" for i, alt in enumerate(alternatives)])}
 
-Which response best addresses the original message? Consider accuracy, clarity, and completeness.
-First, respond with ONLY 'current' or a number (1-{len(alternatives)}).
-Then on a new line, explain your choice in one sentence."""
-        
+Which response is the overall best?
+
+Instructions:
+1.  First line: Respond ONLY with the word 'current' or the number of the best alternative (1-{len(alternatives)}).
+2.  Second line: Provide a brief (1-2 sentence) explanation for your choice.
+
+Example Response:
+current
+This response was the most direct and accurate.
+
+Example Response:
+2
+Alternative 2 offered a clearer step-by-step explanation.
+
+Your evaluation:"""
+
         messages = [{"role": "user", "content": eval_prompt}]
-        evaluation = self._call_api(messages, temperature=0.2, stream=True)
-        print("=" * 50)
-        
-        # Better parsing
-        lines = [line.strip() for line in evaluation.split('\n') if line.strip()]
-        
-        choice = 'current'
-        explanation = "No explanation provided"
-        
-        if lines:
-            first_line = lines[0].lower()
-            if 'current' in first_line:
-                choice = 'current'
+        default_choice = current_best
+        default_explanation = "Defaulted to current best due to evaluation error."
+
+        try:
+            # Use low temperature for consistent evaluation
+            evaluation = self._call_api(messages, temperature=0.1, stream=False)
+            print(f"LLM evaluation response:\n---\n{evaluation}\n---")
+
+            # Robust parsing using regex
+            match = re.match(r"^\s*(current|\d+)\s*\n?(.*)", evaluation, re.DOTALL | re.IGNORECASE)
+
+            if match:
+                choice_str = match.group(1).lower().strip()
+                explanation = match.group(2).strip() if match.group(2) else "No explanation provided."
+
+                if choice_str == 'current':
+                    print(f"Evaluation result: Keep Current. Reason: {explanation}")
+                    return current_best, explanation
+                else:
+                    try:
+                        choice_idx = int(choice_str) - 1
+                        if 0 <= choice_idx < len(alternatives):
+                            print(f"Evaluation result: Select Alternative {choice_idx + 1}. Reason: {explanation}")
+                            return alternatives[choice_idx], explanation
+                        else:
+                            print(f"Warning: Invalid alternative number '{choice_str}' received.")
+                    except ValueError:
+                        print(f"Warning: Could not parse choice number '{choice_str}'.")
             else:
-                for char in first_line:
-                    if char.isdigit():
-                        choice = char
-                        break
-            
-            if len(lines) > 1:
-                explanation = ' '.join(lines[1:])
-        
-        if choice == 'current':
-            return current_best, explanation
-        else:
-            try:
-                index = int(choice) - 1
-                if 0 <= index < len(alternatives):
-                    return alternatives[index], explanation
-            except:
-                pass
-        
-        return current_best, explanation
-    
-    def think_and_respond(self, user_input: str, verbose: bool = True) -> Dict:
-        """Process user input with recursive thinking."""
+                 print("Warning: Could not parse evaluation response format.")
+
+        except Exception as e:
+            print(f"Error during evaluation: {e}")
+        finally:
+            print("=" * 30 + "\n")
+        # Fallback on error
+        print(f"Evaluation failed, keeping current best.")
+        return default_choice, default_explanation
+
+
+    def think_and_respond(self, user_input: str, verbose: bool = True) -> Dict[str, Any]:
+        """
+        Processes user input using the recursive thinking workflow.
+
+        Args:
+            user_input: The user's message.
+            verbose: If True, prints detailed thinking steps.
+
+        Returns:
+            A dictionary containing the final response and thinking history:
+            {
+                "response": str,
+                "thinking_rounds": int,
+                "thinking_history": List[Dict]
+            }
+        """
         print("\n" + "=" * 50)
-        print("🤔 RECURSIVE THINKING PROCESS STARTING")
+        print("🤔 STARTING RECURSIVE THINKING PROCESS")
+        print(f"Original User Input: {user_input}")
         print("=" * 50)
-        
+
+        # 1. Determine rounds needed
         thinking_rounds = self._determine_thinking_rounds(user_input)
-        
         if verbose:
-            print(f"\n🤔 Thinking... ({thinking_rounds} rounds needed)")
-        
-        # Initial response
-        print("\n=== GENERATING INITIAL RESPONSE ===")
-        messages = self.conversation_history + [{"role": "user", "content": user_input}]
-        current_best = self._call_api(messages, stream=True)
-        print("=" * 50)
-        
-        thinking_history = [{"round": 0, "response": current_best, "selected": True}]
-        
-        # Iterative improvement
+            print(f"\n🧠 Estimated Thinking Rounds: {thinking_rounds}")
+
+        # 2. Initial response generation
+        print("\n=== GENERATING INITIAL RESPONSE (Round 0) ===")
+        # Add user input to history temporarily for this call, but commit later
+        initial_messages = self.conversation_history + [{"role": "user", "content": user_input}]
+        try:
+            current_best = self._call_api(initial_messages, stream=True)
+        except Exception as e:
+             return {
+                "response": f"Error generating initial response: {e}",
+                "thinking_rounds": 0,
+                "thinking_history": [{"round": 0, "error": str(e)}]
+            }
+        print("=" * 30)
+
+        # Initialize thinking history for this call
+        call_thinking_history = [{"round": 0, "response": current_best, "selected": True, "explanation": "Initial response"}]
+
+        # 3. Iterative improvement rounds
         for round_num in range(1, thinking_rounds + 1):
             if verbose:
-                print(f"\n=== ROUND {round_num}/{thinking_rounds} ===")
-            
-            # Generate alternatives
-            alternatives = self._generate_alternatives(current_best, user_input)
-            
-            # Store alternatives in history
+                print(f"\n=== STARTING THINKING ROUND {round_num}/{thinking_rounds} ===")
+
+            # 3a. Generate alternatives
+            alternatives = self._generate_alternatives(current_best, user_input, round_num)
+            if not alternatives:
+                 if verbose: print("No alternatives generated, skipping evaluation for this round.")
+                 continue # Skip evaluation if generation failed
+
+            # Add alternatives to this call's history
             for i, alt in enumerate(alternatives):
-                thinking_history.append({
+                call_thinking_history.append({
                     "round": round_num,
                     "response": alt,
                     "selected": False,
                     "alternative_number": i + 1
                 })
-            
-            # Evaluate and select best
+
+            # 3b. Evaluate and select best
             new_best, explanation = self._evaluate_responses(user_input, current_best, alternatives)
-            
-            # Update selection in history
+
+            # Update selection in this call's history and set current_best
             if new_best != current_best:
-                for item in thinking_history:
-                    if item["round"] == round_num and item["response"] == new_best:
-                        item["selected"] = True
-                        item["explanation"] = explanation
-                current_best = new_best
-                
-                if verbose:
-                    print(f"\n    ✓ Selected alternative: {explanation}")
+                 # Find the selected alternative in history and mark it
+                 found = False
+                 for item in call_thinking_history:
+                     if item["round"] == round_num and item["response"] == new_best and not item["selected"]:
+                         item["selected"] = True
+                         item["explanation"] = explanation
+                         found = True
+                         break
+                 if not found:
+                     # Handle case where evaluation returned something unexpected
+                     print(f"Warning: Selected response not found in round {round_num} alternatives.")
+                     # Add it anyway, marking it selected
+                     call_thinking_history.append({
+                         "round": round_num,
+                         "response": new_best,
+                         "selected": True,
+                         "explanation": explanation + " (Added post-evaluation)",
+                         "alternative_number": -1 # Indicate it wasn't a generated alternative
+                     })
+
+                 current_best = new_best
+                 if verbose: print(f"✅ Round {round_num}: New best selected. Reason: {explanation}")
+
             else:
-                for item in thinking_history:
-                    if item["selected"] and item["response"] == current_best:
-                        item["explanation"] = explanation
-                        break
-                
-                if verbose:
-                    print(f"\n    ✓ Kept current response: {explanation}")
-        
-        # Add to conversation history
+                 # Mark the previously selected item (could be from round 0 or previous rounds)
+                 updated_previous = False
+                 for item in reversed(call_thinking_history):
+                     if item["selected"] and item["response"] == current_best:
+                         item["explanation"] = explanation # Update explanation on the existing best
+                         updated_previous = True
+                         break
+                 if not updated_previous:
+                     print(f"Warning: Could not find item to attach 'keep current' explanation for round {round_num}")
+
+                 if verbose: print(f"✅ Round {round_num}: Kept current best. Reason: {explanation}")
+
+            if verbose: print(f"=== COMPLETED THINKING ROUND {round_num}/{thinking_rounds} ===")
+
+
+        # 4. Finalize
+        # Add user input and final assistant response to persistent history
         self.conversation_history.append({"role": "user", "content": user_input})
         self.conversation_history.append({"role": "assistant", "content": current_best})
-        
-        # Keep conversation history manageable
-        if len(self.conversation_history) > 10:
-            self.conversation_history = self.conversation_history[-10:]
-        
+
+        # Keep conversation history manageable (optional: implement token limit instead)
+        history_limit = 10 # Keep last 5 pairs
+        if len(self.conversation_history) > history_limit:
+            self.conversation_history = self.conversation_history[-history_limit:]
+
+        # Append this call's thinking process to the full log
+        self.full_thinking_log.append({
+            "user_input": user_input,
+            "final_response": current_best,
+            "thinking_rounds_executed": thinking_rounds,
+            "history": call_thinking_history,
+            "timestamp": datetime.now().isoformat()
+        })
+
         print("\n" + "=" * 50)
-        print("🎯 FINAL RESPONSE SELECTED")
+        print("🎯 RECURSIVE THINKING PROCESS COMPLETE")
         print("=" * 50)
-        
+
         return {
             "response": current_best,
             "thinking_rounds": thinking_rounds,
-            "thinking_history": thinking_history
+            "thinking_history": call_thinking_history # Return history for this specific call
         }
-    
-    def save_full_log(self, filename: str = None):
-        """Save the full thinking process log."""
+
+    def _save_json(self, data: Any, filename: str, description: str):
+        """Helper to save data to a JSON file."""
+        try:
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            print(f"{description} saved to {filename}")
+        except IOError as e:
+            print(f"Error saving {description} to {filename}: {e}")
+        except TypeError as e:
+            print(f"Error serializing {description} data for saving: {e}")
+
+
+    def save_full_log(self, filename: Optional[str] = None):
+        """Save the accumulated thinking process log from all calls."""
         if filename is None:
             filename = f"full_thinking_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump({
-                "conversation": self.conversation_history,
-                "full_thinking_log": self.full_thinking_log,
-                "timestamp": datetime.now().isoformat()
-            }, f, indent=2, ensure_ascii=False)
-        
-        print(f"Full thinking log saved to {filename}")
-    
-    def save_conversation(self, filename: str = None):
-        """Save the conversation and thinking history."""
+
+        log_data = {
+            "session_model": self.model,
+            "session_start_time": self.full_thinking_log[0]['timestamp'] if self.full_thinking_log else "N/A",
+            "log_save_time": datetime.now().isoformat(),
+            "full_log": self.full_thinking_log # Save the accumulated log
+        }
+        self._save_json(log_data, filename, "Full thinking log")
+
+
+    def save_conversation(self, filename: Optional[str] = None):
+        """Save the main conversation history."""
         if filename is None:
-            filename = f"chat_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump({
-                "conversation": self.conversation_history,
-                "timestamp": datetime.now().isoformat()
-            }, f, indent=2, ensure_ascii=False)
-        
-        print(f"Conversation saved to {filename}")
+            filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_chat_history.json"
+
+        convo_data = {
+             "session_model": self.model,
+             "log_save_time": datetime.now().isoformat(),
+             "conversation": self.conversation_history
+        }
+        self._save_json(convo_data, filename, "Conversation history")
+
+
+def display_thinking_history(history: List[Dict[str, Any]]):
+    """Formats and prints the thinking history for a single call."""
+    print("\n--- DETAILED THINKING PROCESS ---")
+    if not history:
+        print("No thinking history recorded for this call.")
+        return
+
+    last_round = -1
+    for item in history:
+        round_num = item.get("round", "N/A")
+        if round_num != last_round:
+            print(f"\n--- Round {round_num} ---")
+            last_round = round_num
+
+        is_selected = item.get("selected", False)
+        is_initial = (round_num == 0)
+        alt_num = item.get("alternative_number")
+
+        prefix = ""
+        if is_selected:
+            prefix = "✅ [SELECTED]"
+        elif alt_num is not None:
+            prefix = f"   [Alternative {alt_num}]"
+        elif not is_initial :
+             prefix = "   [Intermediate]" # Fallback label
+
+        print(f"{prefix}")
+        # Indent response for clarity
+        response_lines = item.get('response', 'N/A').split('\n')
+        print(f"  Response: {response_lines[0]}")
+        for line in response_lines[1:]:
+            print(f"            {line}")
+
+        explanation = item.get("explanation")
+        if is_selected and explanation:
+            print(f"  Reason: {explanation}")
+        # print("-" * 20) # Optional separator between items
+
+    print("--- END OF THINKING PROCESS ---")
+
 
 def main():
-    print("🤖 Enhanced Recursive Thinking Chat")
+    print("🤖 Enhanced Recursive Thinking Chat Initializing...")
     print("=" * 50)
-    
-    # Get API key
-    api_key = input("Enter your OpenRouter API key (or press Enter to use env variable): ").strip()
+
+    # Get API key - prefer environment variable
+    api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
-        api_key = os.getenv("OPENROUTER_API_KEY")
+        print("⚠️ OPENROUTER_API_KEY environment variable not found.")
+        api_key = input("Enter your OpenRouter API key: ").strip()
         if not api_key:
-            print("Error: No API key provided and OPENROUTER_API_KEY not found in environment")
+            print("❌ Error: No API key provided. Exiting.")
             return
-    
+    else:
+        print("🔑 API key loaded from environment variable.")
+
+    # Choose model (optional)
+    default_model = "mistralai/mistral-7b-instruct:free" # Example free model
+    model_choice = input(f"Enter model name (or press Enter for default: {default_model}): ").strip()
+    model = model_choice if model_choice else default_model
+    print(f"Using model: {model}")
+
     # Initialize chat
-    chat = EnhancedRecursiveThinkingChat(api_key=api_key)
-    
-    print("\nChat initialized! Type 'exit' to quit, 'save' to save conversation.")
-    print("The AI will think recursively before each response.\n")
-    
+    try:
+        chat = EnhancedRecursiveThinkingChat(api_key=api_key, model=model)
+    except ValueError as e:
+        print(f"❌ Error initializing chat: {e}")
+        return
+    except Exception as e:
+         print(f"❌ An unexpected error occurred during initialization: {e}")
+         return
+
+
+    print("\nChat ready! Type 'exit' to quit, 'save' to save conversation, 'save log' to save the full thinking log.")
+    print("The AI will perform recursive thinking before responding.\n")
+
     while True:
-        user_input = input("You: ").strip()
-        
-        if user_input.lower() == 'exit':
+        try:
+            user_input = input("You: ").strip()
+        except EOFError: # Handle Ctrl+D
+             print("\nEOF detected, exiting.")
+             break
+
+        if not user_input:
+            continue
+
+        lower_input = user_input.lower()
+
+        if lower_input == 'exit':
             break
-        elif user_input.lower() == 'save':
+        elif lower_input == 'save':
             chat.save_conversation()
             continue
-        elif user_input.lower() == 'save full':
+        elif lower_input == 'save log':
             chat.save_full_log()
             continue
-        elif not user_input:
-            continue
-        
+
         # Get response with thinking process
-        result = chat.think_and_respond(user_input)
-        
-        print(f"\n🤖 AI FINAL RESPONSE: {result['response']}\n")
-        
-        # Always show complete thinking process
-        print("\n--- COMPLETE THINKING PROCESS ---")
-        for item in result['thinking_history']:
-            print(f"\nRound {item['round']} {'[SELECTED]' if item['selected'] else '[ALTERNATIVE]'}:")
-            print(f"  Response: {item['response']}")
-            if 'explanation' in item and item['selected']:
-                print(f"  Reason for selection: {item['explanation']}")
-            print("-" * 50)
-        print("--------------------------------\n")
-    
-    # Save on exit
-    save_on_exit = input("Save conversation before exiting? (y/n): ").strip().lower()
-    if save_on_exit == 'y':
-        chat.save_conversation()
-        save_full = input("Save full thinking log? (y/n): ").strip().lower()
+        try:
+            result = chat.think_and_respond(user_input, verbose=True) # Keep verbose for demo
+
+            print(f"\n{'='*20} FINAL AI RESPONSE {'='*20}")
+            print(result['response'])
+            print(f"{'='* (40 + len(' FINAL AI RESPONSE '))}\n")
+
+            # Option to display the detailed thinking steps
+            show_thinking = input("Show detailed thinking steps for this response? (y/n, default n): ").strip().lower()
+            if show_thinking == 'y':
+                 display_thinking_history(result['thinking_history'])
+
+        except requests.exceptions.RequestException as e:
+             print(f"\n❌ Network/API Error: {e}. Please check connection/API key and try again.")
+        except Exception as e:
+             print(f"\n❌ An unexpected error occurred: {e}")
+             # Optionally: save state before potentially crashing further
+             # chat.save_conversation("error_dump_convo.json")
+             # chat.save_full_log("error_dump_log.json")
+
+    # Save on exit?
+    print("\nExiting chat.")
+    if chat.conversation_history: # Only ask if there's something to save
+        save_on_exit = input("Save conversation before exiting? (y/n): ").strip().lower()
+        if save_on_exit == 'y':
+            chat.save_conversation()
+
+    if chat.full_thinking_log:
+        save_full = input("Save full thinking log before exiting? (y/n): ").strip().lower()
         if save_full == 'y':
             chat.save_full_log()
-    
-    print("Goodbye! 👋")
+
+    print("\nGoodbye! 👋")
 
 if __name__ == "__main__":
     main()

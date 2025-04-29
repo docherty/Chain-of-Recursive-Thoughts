@@ -19,7 +19,8 @@ class EnhancedRecursiveThinkingChat:
                  model: str = "mistralai/mistral-7b-instruct:free", # Updated default model example
                  base_url: str = "https://openrouter.ai/api/v1",
                  request_timeout: int = 60,
-                 default_max_tokens: int = 4096):
+                 default_max_tokens: int = 4096,
+                 save_directory: str = "chats"): # Added save directory parameter
         """
         Initialize the chat client.
 
@@ -29,6 +30,7 @@ class EnhancedRecursiveThinkingChat:
             base_url: The base URL for the OpenRouter API.
             request_timeout: Timeout in seconds for API requests.
             default_max_tokens: Default maximum tokens for API responses.
+            save_directory: The subdirectory name to save chat logs and history.
         """
         self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
         if not self.api_key:
@@ -39,6 +41,7 @@ class EnhancedRecursiveThinkingChat:
         self.request_timeout = request_timeout
         self.default_max_tokens = default_max_tokens
         self.chat_completions_url = f"{self.base_url}/chat/completions"
+        self.save_directory = save_directory # Store save directory
 
         self.headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -436,19 +439,31 @@ Your evaluation:"""
         }
 
     def _save_json(self, data: Any, filename: str, description: str):
-        """Helper to save data to a JSON file."""
+        """Helper to save data to a JSON file in the designated subdirectory."""
         try:
-            with open(filename, 'w', encoding='utf-8') as f:
+            # Ensure the save directory exists
+            os.makedirs(self.save_directory, exist_ok=True)
+
+            # Construct the full path
+            full_path = os.path.join(self.save_directory, filename)
+
+            with open(full_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
-            print(f"{description} saved to {filename}")
+            print(f"{description} saved to {full_path}")
         except IOError as e:
-            print(f"Error saving {description} to {filename}: {e}")
+            print(f"Error saving {description} to {full_path}: {e}")
         except TypeError as e:
             print(f"Error serializing {description} data for saving: {e}")
+        except Exception as e: # Catch other potential errors like permission issues
+             print(f"An unexpected error occurred while saving {description} to {full_path}: {e}")
 
 
     def save_full_log(self, filename: Optional[str] = None):
         """Save the accumulated thinking process log from all calls."""
+        if not self.full_thinking_log:
+            print("No thinking log entries to save.")
+            return
+
         if filename is None:
             filename = f"full_thinking_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
 
@@ -463,8 +478,12 @@ Your evaluation:"""
 
     def save_conversation(self, filename: Optional[str] = None):
         """Save the main conversation history."""
+        if not self.conversation_history:
+            print("No conversation history to save.")
+            return
+
         if filename is None:
-            filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_chat_history.json"
+            filename = f"chat_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json" # Renamed for clarity
 
         convo_data = {
              "session_model": self.model,
@@ -536,9 +555,14 @@ def main():
     model = model_choice if model_choice else default_model
     print(f"Using model: {model}")
 
+    # Define save directory
+    save_dir = "chats"
+    print(f"Logs and history will be saved to the '{save_dir}/' directory.")
+
     # Initialize chat
     try:
-        chat = EnhancedRecursiveThinkingChat(api_key=api_key, model=model)
+        # Pass the save directory to the constructor
+        chat = EnhancedRecursiveThinkingChat(api_key=api_key, model=model, save_directory=save_dir)
     except ValueError as e:
         print(f"❌ Error initializing chat: {e}")
         return
